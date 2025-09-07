@@ -1,0 +1,1010 @@
+#!/usr/bin/env python3
+"""
+Encrypted's Texture Converter - 1.0
+A universal DDS texture converter
+"""
+
+import os
+import re
+import sys
+import json
+import threading
+import subprocess
+import webbrowser
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from shutil import which
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, Toplevel, Text
+
+try:
+    from PIL import Image, ImageTk
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    print("Warning: PIL/Pillow not available. Image previews disabled.")
+
+# Constants
+ALL_FORMATS = [
+    "BC1_UNORM", "BC1_UNORM_SRGB", "BC3_UNORM", "BC4_UNORM",
+    "BC5_UNORM", "BC5_SNORM", "BC6H_UF16", "BC7_UNORM", "BC7_UNORM_SRGB",
+    "R8_UNORM", "R8G8B8A8_UNORM", "R8G8B8A8_UNORM_SRGB", "R8G8B8A8_SNORM", "B8G8R8A8_UNORM",
+]
+
+SUFFIX_MAP_GENERAL = {
+    "_color": "BC1_UNORM_SRGB",
+    "_emissive": "BC1_UNORM_SRGB",
+    "_ao": "BC4_UNORM",
+    "_metal": "BC4_UNORM",
+    "_rough": "BC4_UNORM",
+    "_transmissive": "BC4_UNORM",
+    "_opacity": "BC4_UNORM",
+    "_height": "BC4_UNORM",
+    "_mask": "BC4_UNORM",
+    "_normal": "BC5_SNORM",
+}
+
+FOLDER_CASES = {
+    "faces/chargen": {
+        "_color": "R8G8B8A8_UNORM_SRGB",
+        "_ao": "R8_UNORM",
+        "_rough": "R8_UNORM",
+        "_mask": "R8_UNORM",
+        "_normal": "R8G8B8A8_SNORM"
+    },
+    "effects/gradients": {"*": "B8G8R8A8_UNORM"},
+    "effects/luts": {"*": "R8G8B8A8_UNORM"},
+    "effects/luts hdr": {"*": "BC6H_UF16"},
+    "effects/luts (hdr)": {"*": "BC6H_UF16"},
+    "interface/skillpatches": {"*": "BC3_UNORM"},
+    "interface/inventoryicons": {"*": "BC3_UNORM"},
+    "interface/loadscreens": {"*": "BC7_UNORM"},
+    "interface/photomode": {"*": "BC7_UNORM"},
+}
+
+ALIASES_COLORLIKE = [s.lower() for s in [
+    "_color", "_c", "_emissive", "_e", "_diffuse", "_d",
+    "_albedo", "_glow"
+]]
+
+ALIASES_NORMAL = [s.lower() for s in ["_normal", "_n"]]
+
+ALIASES_MASKLIKE = [s.lower() for s in [
+    "_ao", "_ambientocclusion", "_m", "_metal", "_metallic",
+    "_r", "_rough", "_roughness",
+    "_t", "_transmissive", "_o", "_opacity", "_h", "_height", "_mask"
+]]
+
+POLICY_BC7 = {
+    "fmt": "BC7_UNORM_SRGB",
+    "mips": 0,
+    "mip_filter": "LANCZOS",
+    "gamma": True,
+    "srgb_hint": True,
+    "dx10": True
+}
+
+POLICY_BC5 = {
+    "fmt": "BC5_SNORM",
+    "mips": 0,
+    "mip_filter": "LANCZOS",
+    "gamma": False,
+    "srgb_hint": False,
+    "dx10": True
+}
+
+POLICY_BC4 = {
+    "fmt": "BC4_UNORM",
+    "mips": 0,
+    "mip_filter": "LANCZOS",
+    "gamma": False,
+    "srgb_hint": False,
+    "dx10": True
+}
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".dds", ".tga", ".bmp"}
+
+# Color scheme
+BG_FALLBACK = "#0b0821"
+BOX = "#393939"
+BOX2 = "#2f2f2f"
+FG = "#f6f3ff"
+ACCENT = "#8c5cff"
+
+NAMING_GUIDE_TEXT = """Please ensure your textures follow standard naming conventions:
+
+Color: _color, _c, _diffuse, _d, _albedo
+Normal: _normal, _n
+Metal: _metal, _m, _metallic
+Rough: _rough, _r, _roughness
+Opacity: _opacity, _transmissive
+AO: _ao, _ambientocclusion
+Emissive: _emissive, _e
+Mask: _mask, _m
+"""
+
+@dataclass
+class Encoder:
+    name: str
+    path: str
+
+@dataclass
+class WorkItem:
+    src: Path
+    out_dir: Path
+    fmt: str
+    out_name: str
+    policy: Dict
+
+# Utility functions
+def to_lower_path(p: Path) -> str:
+    return str(p).replace("\\", "/").lower()
+
+def stem_lower(name: str) -> str:
+    return re.sub(r"\.(dds|png|jpg|jpeg|tga|bmp)$", "", name, flags=re.IGNORECASE).lower()
+
+def clean_path(s: str) -> str:
+    s = s.strip()
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1]
+    return s
+
+def exists_executable(p: str) -> bool:
+    try:
+        return os.path.isfile(p) and os.access(p, os.X_OK)
+    except Exception:
+        return False
+
+def find_in_dir_ci(dirpath: Path, base_name: str) -> Optional[str]:
+    """Case-insensitive search for executable in directory"""
+    bn = base_name.lower()
+    try:
+        for entry in dirpath.iterdir():
+            if entry.name.lower() == bn and exists_executable(str(entry)):
+                return str(entry)
+    except Exception:
+        pass
+    return None
+
+def find_executable(name: str, explicit_path: Optional[str] = None) -> Optional[str]:
+    """Find executable with case-insensitive search"""
+    # Check explicit path first
+    if explicit_path:
+        ep = clean_path(explicit_path)
+        if exists_executable(ep):
+            return ep
+        p = Path(ep)
+        if p.parent.exists():
+            ci = find_in_dir_ci(p.parent, p.name)
+            if ci:
+                return ci
+    
+    # Check system PATH
+    try:
+        w = which(name)
+        if w and exists_executable(w):
+            return w
+        if os.name == "nt" and not name.lower().endswith(".exe"):
+            w = which(name + ".exe")
+            if w and exists_executable(w):
+                return w
+    except Exception:
+        pass
+    
+    # Check current directory and script directory
+    for base in [Path.cwd(), Path(__file__).resolve().parent]:
+        for cand in [name, name + ".exe", name + ".bat", name + ".cmd"]:
+            p = base / cand
+            if exists_executable(str(p)):
+                return str(p)
+            ci = find_in_dir_ci(base, cand)
+            if ci:
+                return ci
+    
+    # Check PATH manually
+    for raw in os.environ.get("PATH", "").split(os.pathsep):
+        d = Path(clean_path(raw))
+        if not d.exists():
+            continue
+        for cand in [name, name + ".exe", name + ".bat", name + ".cmd"]:
+            p = d / cand
+            if exists_executable(str(p)):
+                return str(p)
+            ci = find_in_dir_ci(d, cand)
+            if ci:
+                return ci
+    
+    return None
+
+def detect_encoder(preferred: Optional[str], texconv_override: Optional[str], 
+                  compress_override: Optional[str]) -> Optional[Encoder]:
+    """Detect available texture conversion tools"""
+    order = (["texconv", "compressonator"] if preferred is None 
+             else [preferred] + [x for x in ["texconv", "compressonator"] if x != preferred])
+    
+    for nm in order:
+        if nm == "texconv":
+            p = find_executable("texconv", texconv_override)
+            if p:
+                return Encoder("texconv", p)
+        else:
+            p = find_executable("compressonatorcli", compress_override)
+            if p:
+                return Encoder("compressonator", p)
+    
+    return None
+
+# Format detection functions
+def decide_category_by_alias(name: str) -> Optional[str]:
+    """Determine texture category based on filename"""
+    s = stem_lower(name)
+    for suf in sorted(ALIASES_COLORLIKE, key=len, reverse=True):
+        if s.endswith(suf):
+            return "COLORLIKE"
+    for suf in sorted(ALIASES_NORMAL, key=len, reverse=True):
+        if s.endswith(suf):
+            return "NORMAL"
+    for suf in sorted(ALIASES_MASKLIKE, key=len, reverse=True):
+        if s.endswith(suf):
+            return "MASKLIKE"
+    return None
+
+def detect_case_folder(path: Path) -> Optional[str]:
+    """Detect special folder cases"""
+    np = to_lower_path(path.parent)
+    for key in FOLDER_CASES.keys():
+        if key in np:
+            return key
+    return None
+
+def decide_format_auto(path: Path) -> str:
+    """Auto-detect appropriate format for texture"""
+    cat = decide_category_by_alias(path.name)
+    if cat == "COLORLIKE":
+        return POLICY_BC7["fmt"]
+    if cat == "NORMAL":
+        return POLICY_BC5["fmt"]
+    if cat == "MASKLIKE":
+        return POLICY_BC4["fmt"]
+    
+    folder_key = detect_case_folder(path)
+    if folder_key:
+        rules = FOLDER_CASES[folder_key]
+        for suf, dst in sorted(rules.items(), key=lambda kv: len(kv[0]), reverse=True):
+            if suf == "*":
+                continue
+            if stem_lower(path.name).endswith(suf):
+                return dst
+        if "*" in rules:
+            return rules["*"]
+    
+    for suf, dst in sorted(SUFFIX_MAP_GENERAL.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if stem_lower(path.name).endswith(suf):
+            return dst
+    
+    return "BC7_UNORM"
+
+def map_mip_filter_for_texconv(name: str) -> Optional[str]:
+    """Map mipmap filter names for texconv"""
+    n = (name or "").strip().upper()
+    if n in ("", "AUTO"):
+        return None
+    if n in ("POINT", "LINEAR", "CUBIC", "FANT", "BOX", "TRIANGLE"):
+        return n
+    if n in ("LANCZOS", "LANCOS", "LANCOST"):
+        return "CUBIC"
+    return None
+
+def build_texconv_cmd(texconv: str, src: Path, out_dir: Path, fmt: str, policy: Dict) -> List[str]:
+    """Build texconv command line"""
+    args = [texconv, "-nologo", "-y", "-f", fmt, "-o", str(out_dir)]
+    
+    if policy.get("dx10"):
+        args.append("-dx10")
+    if fmt.endswith("_SRGB") or policy.get("srgb_hint"):
+        args.append("-srgb")
+    
+    mips = policy.get("mips", -1)
+    if mips >= 0:
+        args.extend(["-m", str(mips)])
+    
+    mf = map_mip_filter_for_texconv(policy.get("mip_filter", "AUTO"))
+    if mf:
+        args.extend(["-if", mf])
+    
+    args.append(str(src))
+    return args
+
+def build_compressonator_cmd(cli: str, src: Path, out_path: Path, fmt: str, policy: Dict) -> List[str]:
+    """Build Compressonator CLI command line"""
+    format_map = {
+        "BC1_UNORM": "BC1", "BC1_UNORM_SRGB": "BC1_SRGB", "BC3_UNORM": "BC3", "BC4_UNORM": "BC4",
+        "BC5_UNORM": "BC5", "BC5_SNORM": "BC5_SNORM", "BC6H_UF16": "BC6H", "BC7_UNORM": "BC7", 
+        "BC7_UNORM_SRGB": "BC7_SRGB", "R8G8B8A8_UNORM": "RGBA8888", "R8G8B8A8_UNORM_SRGB": "RGBA8888_SRGB",
+        "B8G8R8A8_UNORM": "BGRA8888", "R8_UNORM": "R8", "R8G8B8A8_SNORM": "RGBA8888_SNORM",
+    }
+    
+    args = [cli, "-fd", format_map.get(fmt, fmt)]
+    
+    mips = policy.get("mips", -1)
+    if mips >= 0:
+        args.extend(["-miplevels", str(mips)])
+    
+    args.extend([str(src), str(out_path)])
+    return args
+
+def plan_jobs(roots: List[Path], out_dir: Path, per_file_overrides: Dict[str, str]) -> List[WorkItem]:
+    """Plan conversion jobs from input roots"""
+    jobs = []
+    
+    def policy_for_name(name: str) -> Dict:
+        cat = decide_category_by_alias(name)
+        if cat == "COLORLIKE":
+            return POLICY_BC7.copy()
+        if cat == "NORMAL":
+            return POLICY_BC5.copy()
+        if cat == "MASKLIKE":
+            return POLICY_BC4.copy()
+        return {
+            "fmt": decide_format_auto(Path(name)),
+            "mips": -1,
+            "mip_filter": "AUTO",
+            "gamma": False,
+            "srgb_hint": False,
+            "dx10": False
+        }
+    
+    for root in roots:
+        root = Path(root)
+        if root.is_file():
+            if root.suffix.lower() in IMAGE_EXTS:
+                pol = policy_for_name(root.name)
+                fmt = per_file_overrides.get(str(root), pol["fmt"])
+                jobs.append(WorkItem(root, out_dir, fmt, root.with_suffix(".dds").name, pol))
+        else:
+            for r, _, files in os.walk(root):
+                for f in files:
+                    p = Path(r) / f
+                    if p.suffix.lower() in IMAGE_EXTS:
+                        pol = policy_for_name(p.name)
+                        fmt = per_file_overrides.get(str(p), pol["fmt"])
+                        try:
+                            rel = p.relative_to(root).with_suffix(".dds")
+                            jobs.append(WorkItem(p, out_dir / rel.parent, fmt, rel.name, pol))
+                        except Exception:
+                            jobs.append(WorkItem(p, out_dir, fmt, p.with_suffix(".dds").name, pol))
+    
+    return jobs
+
+def convert_item(enc: Encoder, item: WorkItem) -> Tuple[bool, str, Path]:
+    """Convert a single texture item"""
+    item.out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = item.out_dir / item.out_name
+    
+    try:
+        if enc.name == "texconv":
+            cmd = build_texconv_cmd(enc.path, item.src, item.out_dir, item.fmt, item.policy)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            ok = res.returncode == 0
+            msg = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
+            return ok, msg, out_path
+        else:
+            cmd = build_compressonator_cmd(enc.path, item.src, out_path, item.fmt, item.policy)
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            ok = (res.returncode == 0 and out_path.exists())
+            msg = (res.stdout or "") + ("\n" + res.stderr if res.stderr else "")
+            return ok, msg, out_path
+    except Exception as e:
+        return False, f"Exception: {e}", out_path
+
+class StaticBackground:
+    """Handles static background image rendering"""
+    
+    def __init__(self, root, img_path):
+        self.root = root
+        self.img_path = img_path
+        self.canvas = tk.Canvas(root, highlightthickness=0, bd=0, bg=BG_FALLBACK)
+        self.canvas.place(x=0, y=0, relwidth=1, relheight=1)
+        self.photo = None
+        self._last_size = (0, 0)
+        
+        root.bind("<Configure>", self._on_resize)
+        self._redraw()
+
+    def _load_scaled(self, w, h):
+        """Load and scale background image"""
+        if not PIL_AVAILABLE or not self.img_path.exists():
+            return None
+        try:
+            im = Image.open(self.img_path).convert("RGB")
+            im = im.resize((max(1, w), max(1, h)), Image.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:
+            return None
+
+    def _redraw(self):
+        """Redraw background with current window size"""
+        w = max(2, self.root.winfo_width())
+        h = max(2, self.root.winfo_height())
+        
+        # Only redraw if size changed significantly
+        if abs(w - self._last_size[0]) > 10 or abs(h - self._last_size[1]) > 10:
+            self._last_size = (w, h)
+            ph = self._load_scaled(w, h)
+            if ph is not None:
+                self.photo = ph
+                self.canvas.delete("all")
+                self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+                try:
+                    self.canvas.tk.call('lower', self.canvas._w)
+                except Exception:
+                    pass
+
+    def _on_resize(self, e):
+        """Handle window resize events"""
+        if e.widget == self.root:
+            self.root.after_idle(self._redraw)
+
+class TextureConverterApp:
+    """Main application class"""
+    
+    THUMB = (164, 164)
+    CFG = Path(__file__).with_name("etc_gui_config_v4_2.json")
+    
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Encrypted's Universal DDS Converter")
+        self.root.geometry("1240x900")
+        
+        # Initialize variables
+        self.cards = []
+        self.img_cache = {}
+        self.per_file_overrides = {}
+        self.conversion_in_progress = False
+        
+        # Create UI
+        self._create_background()
+        self._create_header()
+        self._create_top_panel()
+        self._create_middle_area()
+        self._create_bottom_panel()
+        self._create_credits()
+        
+        # Initialize encoder
+        self.enc = self._detect_encoder()
+        
+        # Load configuration
+        self._load_config()
+        
+        # Set up event handlers
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Auto-open folder dialog if no sources
+        if self.src_list.size() == 0:
+            self.root.after(300, self.add_folder)
+
+    def _create_background(self):
+        """Create static background"""
+        img_path = Path(__file__).with_name("background.webp")
+        self.bg = StaticBackground(self.root, img_path)
+
+    def _create_header(self):
+        """Create application header with logo and links"""
+        header = tk.Frame(self.root, bg=BG_FALLBACK)
+        header.pack(fill="x", pady=(6, 0))
+        
+        # Logo
+        self.logo_lbl = tk.Label(header, bg=BG_FALLBACK, fg=FG)
+        self.logo_lbl.pack(side="left", padx=10, pady=6)
+        
+        if PIL_AVAILABLE:
+            try:
+                logo_path = Path(__file__).with_name("EncryptedStudios_256x256.png")
+                if logo_path.exists():
+                    im = Image.open(logo_path)
+                    im.thumbnail((64, 64))
+                    img = ImageTk.PhotoImage(im)
+                    self.logo_lbl.configure(image=img)
+                    self.logo_lbl.image = img
+                else:
+                    self.logo_lbl.configure(text="[EncryptedStudios]")
+            except Exception:
+                self.logo_lbl.configure(text="[EncryptedStudios]")
+        else:
+            self.logo_lbl.configure(text="[EncryptedStudios]")
+        
+        # Title
+        title = tk.Label(header, text="Encrypted's Universal DDS Converter",
+                        font=("Segoe UI", 16, "bold"), fg=FG, bg=BG_FALLBACK)
+        title.pack(side="left", padx=10)
+        
+        # Links
+        links = tk.Frame(header, bg=BG_FALLBACK)
+        links.pack(side="right", padx=12)
+        
+        patreon_link = self._create_link(links, "Patreon", 
+                                       "https://www.patreon.com/c/EncryptedStudios98", 
+                                       "#d3b9ff")
+        patreon_link.pack(side="right", padx=8)
+        
+        discord_link = self._create_link(links, "Discord", 
+                                       "https://discord.gg/QxVUMX447v", 
+                                       "#a8d0ff")
+        discord_link.pack(side="right", padx=8)
+
+    def _create_link(self, parent, text, url, fg):
+        """Create a clickable link label"""
+        lbl = tk.Label(parent, text=text, fg=fg, bg=BG_FALLBACK, cursor="hand2",
+                      font=("Segoe UI", 10, "underline"))
+        lbl.bind("<Button-1>", lambda e: webbrowser.open_new(url))
+        return lbl
+
+    def _create_top_panel(self):
+        """Create top control panel"""
+        top = tk.Frame(self.root, bg=BOX, padx=10, pady=6)
+        top.pack(fill="x", padx=10, pady=8)
+        
+        # Variables
+        self.out_dir = tk.StringVar(value=str(Path('.').resolve() / '_out'))
+        self.encoder_pref = tk.StringVar(value="")
+        self.texconv = tk.StringVar(value="")
+        self.compress = tk.StringVar(value="")
+        
+        # Output directory controls
+        tk.Label(top, text="Output:", fg=FG, bg=BOX).pack(side="left", padx=(10, 2))
+        
+        output_entry = tk.Entry(top, textvariable=self.out_dir, width=60, bg=BOX2, fg=FG,
+                               insertbackground=FG, relief="flat")
+        output_entry.pack(side="left")
+        
+        tk.Button(top, text="Browse", command=self.pick_output, bg=BOX2, fg=FG,
+                 activebackground=ACCENT).pack(side="left", padx=4)
+        
+        # Right side controls
+        tk.Button(top, text="Pick Encoder…", command=self.pick_encoder, bg=BOX2, fg=FG,
+                 activebackground=ACCENT).pack(side="right")
+        
+        self.enc_label = tk.Label(top, text="Encoder: scanning…", fg=FG, bg=BOX)
+        self.enc_label.pack(side="right", padx=(0, 10))
+        
+        tk.Button(top, text="Naming Conventions", command=self.show_guide, bg=BOX2, fg=FG).pack(side="right", padx=8)
+        tk.Button(top, text="About", command=self.show_about, bg=BOX2, fg=FG).pack(side="right", padx=8)
+
+    def _create_middle_area(self):
+        """Create main middle area with source list and preview"""
+        mid = tk.Frame(self.root, bg=BG_FALLBACK)
+        mid.pack(fill="both", expand=True, padx=10, pady=6)
+        
+        # Left panel - source list
+        left = tk.Frame(mid, bg=BOX, padx=8, pady=8)
+        left.pack(side="left", fill="y")
+        
+        tk.Label(left, text="Sources", bg=BOX, fg=FG).pack(anchor="w")
+        
+        self.src_list = tk.Listbox(left, selectmode="extended", width=50, height=18,
+                                  bg=BOX2, fg=FG, highlightthickness=0, selectbackground=ACCENT)
+        self.src_list.pack(fill="y")
+        
+        # Source list buttons
+        btns = tk.Frame(left, bg=BOX)
+        btns.pack(fill="x", pady=6)
+        
+        button_configs = [
+            ("Add Folder…", self.add_folder),
+            ("Add Files…", self.add_files),
+            ("Remove", self.remove_selected),
+            ("Clear", self.clear_sources)
+        ]
+        
+        for text, cmd in button_configs:
+            tk.Button(btns, text=text, command=cmd, bg=BOX2, fg=FG,
+                     activebackground=ACCENT).pack(side="left", padx=4)
+        
+        tk.Button(left, text="Scan All", command=self.scan_all, bg=BOX2, fg=FG,
+                 activebackground=ACCENT).pack(fill="x", pady=(6, 0))
+        
+        # Right panel - preview area
+        right = tk.Frame(mid, bg=BOX)
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        
+        self.canvas = tk.Canvas(right, background=BOX, highlightthickness=0)
+        
+        scrollbar = tk.Scrollbar(right, orient="vertical", command=self.canvas.yview)
+        scrollbar.pack(side="right", fill="y")
+        
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        
+        self.inner = tk.Frame(self.canvas, bg=BOX)
+        self.inner_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfigure(self.inner_id, width=e.width))
+
+    def _create_bottom_panel(self):
+        """Create bottom control panel"""
+        bottom = tk.Frame(self.root, bg=BOX, padx=10, pady=8)
+        bottom.pack(fill="x", padx=10, pady=8)
+        
+        # Progress bar
+        self.progress = ttk.Progressbar(bottom, length=340, mode="determinate")
+        self.progress.pack(side="left")
+        
+        # Status
+        tk.Label(bottom, text="Status:", bg=BOX, fg=FG).pack(side="left", padx=(10, 2))
+        self.status = tk.Label(bottom, text="Idle", bg=BOX, fg=FG)
+        self.status.pack(side="left", padx=(0, 10))
+        
+        # Convert button
+        tk.Button(bottom, text="Convert All", command=self.convert_all, bg=BOX2, fg=FG,
+                 activebackground=ACCENT).pack(side="right")
+
+    def _create_credits(self):
+        """Create credits label"""
+        credits = tk.Label(self.root,
+                          text="Shout-out to VikoizBeast for testing the tool and providing inspiration.",
+                          fg="#d6d1ff", bg=BG_FALLBACK, anchor="w")
+        credits.pack(fill="x", padx=12, pady=(0, 10))
+
+    # Dialog methods
+    def show_guide(self):
+        """Show naming conventions guide"""
+        win = Toplevel(self.root)
+        win.title("Texture Naming Conventions")
+        win.configure(bg=BOX)
+        win.geometry("600x400")
+        
+        txt = Text(win, wrap="word", width=80, height=18, bg=BOX, fg=FG, insertbackground=FG)
+        txt.insert("1.0", NAMING_GUIDE_TEXT)
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def show_about(self):
+        """Show about dialog"""
+        messagebox.showinfo("About",
+            "Encrypted's Universal DDS Converter\n\n"
+            "Links:\n"
+            " • Patreon: https://www.patreon.com/c/EncryptedStudios98\n"
+            " • Discord: https://discord.gg/QxVUMX447v\n\n"
+            "Credits:\n"
+            " • Shout-out to VikoizBeast for testing the tool and providing inspiration.\n\n"
+            "This tool uses either texconv or Compressonator CLI for encoding.\n"
+        )
+
+    # Configuration methods
+    def _load_config(self):
+        """Load configuration from file"""
+        try:
+            if self.CFG.exists():
+                data = json.loads(self.CFG.read_text(encoding="utf-8"))
+                
+                self.out_dir.set(data.get("out", self.out_dir.get()))
+                self.encoder_pref.set(data.get("encoder", ""))
+                self.texconv.set(data.get("texconv", ""))
+                self.compress.set(data.get("compress", ""))
+                self.per_file_overrides = data.get("per_file_overrides", {})
+                
+                # Restore sources
+                for source in data.get("sources", []):
+                    if Path(source).exists():
+                        self.src_list.insert("end", source)
+        except Exception:
+            pass
+
+    def _save_config(self):
+        """Save configuration to file"""
+        data = {
+            "out": self.out_dir.get(),
+            "encoder": self.enc.name if self.enc else self.encoder_pref.get() or "",
+            "texconv": self.texconv.get(),
+            "compress": self.compress.get(),
+            "sources": list(self.src_list.get(0, "end")),
+            "per_file_overrides": self.per_file_overrides,
+        }
+        try:
+            self.CFG.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    # Input methods
+    def pick_output(self):
+        """Pick output directory"""
+        d = filedialog.askdirectory(title="Choose output folder")
+        if d:
+            self.out_dir.set(d)
+
+    def pick_encoder(self):
+        """Pick encoder executable"""
+        path = filedialog.askopenfilename(
+            title="Pick texconv.exe or compressonatorcli.exe",
+            filetypes=[("Executables", "*.exe *.bat *.cmd *.sh *.bin"), ("All", "*.*")]
+        )
+        if not path:
+            return
+        
+        name = Path(path).name.lower()
+        if "texconv" in name:
+            self.texconv.set(path)
+            self.encoder_pref.set("texconv")
+        elif "compressonator" in name:
+            self.compress.set(path)
+            self.encoder_pref.set("compressonator")
+        else:
+            messagebox.showerror("Not supported", "Pick texconv or Compressonator")
+            return
+        
+        self.enc = self._detect_encoder()
+        self._save_config()
+
+    def add_folder(self):
+        """Add input folder"""
+        d = filedialog.askdirectory(title="Add input folder")
+        if d:
+            self.src_list.insert("end", d)
+
+    def add_files(self):
+        """Add input files"""
+        files = filedialog.askopenfilenames(
+            title="Add input files",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.dds *.tga *.bmp"), ("All", "*.*")]
+        )
+        for f in files or []:
+            self.src_list.insert("end", f)
+
+    def remove_selected(self):
+        """Remove selected sources"""
+        for i in reversed(self.src_list.curselection()):
+            self.src_list.delete(i)
+
+    def clear_sources(self):
+        """Clear all sources"""
+        self.src_list.delete(0, "end")
+
+    def _detect_encoder(self) -> Optional[Encoder]:
+        """Detect encoder and update UI"""
+        enc = detect_encoder(
+            self.encoder_pref.get() or None,
+            self.texconv.get() or None,
+            self.compress.get() or None
+        )
+        self.enc_label.configure(text=f"Encoder: {enc.name if enc else 'NOT FOUND'}")
+        return enc
+
+    def _clear_grid(self):
+        """Clear preview grid"""
+        for _, frame, _, _, _ in self.cards:
+            frame.destroy()
+        self.cards.clear()
+        self.img_cache.clear()
+
+    # Scan and convert methods
+    def scan_all(self):
+        """Scan all sources for images"""
+        if self.conversion_in_progress:
+            messagebox.showwarning("Busy", "Conversion in progress. Please wait.")
+            return
+            
+        self._clear_grid()
+        roots = [Path(s) for s in self.src_list.get(0, "end")]
+        if not roots:
+            messagebox.showinfo("Scan", "Add a folder or files first.")
+            return
+        
+        self.status.configure(text="Scanning…")
+        out_dir = Path(self.out_dir.get())
+        
+        def work():
+            try:
+                jobs = plan_jobs(roots, out_dir, self.per_file_overrides)
+                self.root.after(0, lambda: self._post_scan(jobs))
+            except Exception as e:
+                self.root.after(0, lambda: self._scan_error(str(e)))
+        
+        threading.Thread(target=work, daemon=True).start()
+
+    def _post_scan(self, jobs: List[WorkItem]):
+        """Handle scan completion"""
+        if not jobs:
+            messagebox.showinfo("Scan", "No images found.")
+            self.status.configure(text="Idle")
+            return
+        
+        self.status.configure(text=f"Found {len(jobs)} images")
+        for j in jobs:
+            self._add_card(j.src, j.fmt, j.policy)
+
+    def _scan_error(self, error_msg: str):
+        """Handle scan error"""
+        messagebox.showerror("Scan Error", f"Error during scan: {error_msg}")
+        self.status.configure(text="Scan failed")
+
+    def _add_card(self, path: Path, fmt: str, policy: Dict):
+        """Add preview card for image"""
+        frame = tk.Frame(self.inner, bg=BOX, padx=8, pady=8)
+        row = len(self.cards)
+        frame.grid(row=row, column=0, sticky="ew", pady=6)
+        frame.columnconfigure(1, weight=1)
+        
+        # Thumbnail
+        thumb = tk.Label(frame, text="(loading)", bg=BOX, fg=FG)
+        thumb.grid(row=0, column=0, rowspan=3, sticky="nsw", padx=6)
+        
+        # Path and format info
+        tk.Label(frame, text=str(path), bg=BOX, fg=FG).grid(row=0, column=1, sticky="w")
+        tk.Label(frame, text=f"Suggested: {fmt}", bg=BOX, fg=FG).grid(row=1, column=1, sticky="w")
+        
+        mips_val = policy.get("mips", -1)
+        poltxt = f"Policy: mips={'auto' if mips_val == 0 else mips_val}, filter={policy.get('mip_filter', 'AUTO')}, gamma={'ON' if policy.get('gamma') else 'OFF'}"
+        tk.Label(frame, text=poltxt, bg=BOX, fg=FG).grid(row=2, column=1, sticky="w")
+        
+        # Format override combo
+        combo = ttk.Combobox(frame, values=ALL_FORMATS, width=20)
+        combo.set(self.per_file_overrides.get(str(path), fmt))
+        combo.grid(row=0, column=2, sticky="e", padx=6)
+        tk.Label(frame, text="Override", bg=BOX, fg=FG).grid(row=1, column=2, sticky="e")
+        
+        # Status and convert button
+        status = tk.Label(frame, text="Ready", bg=BOX, fg=FG)
+        status.grid(row=0, column=3, sticky="e", padx=6)
+        
+        ttk.Button(frame, text="Convert", 
+                  command=lambda p=str(path), c=combo, s=status, pol=policy: 
+                  self.convert_one(p, c.get(), pol, s)).grid(row=2, column=3, sticky="e")
+        
+        self.cards.append((str(path), frame, combo, status, policy))
+        
+        # Load thumbnail asynchronously
+        if PIL_AVAILABLE:
+            def load_thumbnail():
+                try:
+                    im = Image.open(path)
+                    im.thumbnail(self.THUMB)
+                    tkimg = ImageTk.PhotoImage(im)
+                    self.root.after(0, lambda: self._set_thumbnail(thumb, tkimg, str(path)))
+                except Exception as e:
+                    self.root.after(0, lambda: thumb.configure(text=f"(no preview: {e})"))
+            
+            threading.Thread(target=load_thumbnail, daemon=True).start()
+
+    def _set_thumbnail(self, thumb_label, tkimg, path_str):
+        """Set thumbnail image"""
+        thumb_label.configure(image=tkimg, text="")
+        self.img_cache[path_str] = tkimg
+
+    def convert_one(self, path_str: str, fmt: str, policy: Dict, status_lbl):
+        """Convert single item"""
+        if not self.enc:
+            messagebox.showerror("Encoder not found", "Pick encoder or add to PATH.")
+            return
+        
+        if self.conversion_in_progress:
+            messagebox.showwarning("Busy", "Conversion in progress. Please wait.")
+            return
+        
+        self.per_file_overrides[path_str] = fmt
+        self._save_config()
+        
+        path = Path(path_str)
+        out_dir = Path(self.out_dir.get())
+        
+        # Find base directory for relative paths
+        base = None
+        for s in self.src_list.get(0, "end"):
+            sp = Path(s)
+            try:
+                path.relative_to(sp)
+                base = sp
+                break
+            except Exception:
+                pass
+        
+        if base:
+            rel = path.relative_to(base).with_suffix(".dds")
+            item = WorkItem(path, out_dir / rel.parent, fmt, rel.name, policy)
+        else:
+            item = WorkItem(path, out_dir, fmt, path.with_suffix(".dds").name, policy)
+        
+        status_lbl.configure(text="Converting…")
+        
+        def run_conversion():
+            try:
+                ok, msg, outp = convert_item(self.enc, item)
+                self.root.after(0, lambda: self._conversion_done(status_lbl, ok, msg, path.name))
+            except Exception as e:
+                self.root.after(0, lambda: self._conversion_done(status_lbl, False, str(e), path.name))
+        
+        threading.Thread(target=run_conversion, daemon=True).start()
+
+    def _conversion_done(self, status_lbl, ok: bool, msg: str, filename: str):
+        """Handle single conversion completion"""
+        status_lbl.configure(text="Done" if ok else "Failed")
+        if not ok:
+            messagebox.showerror("Conversion failed", f"{filename}\n\n{msg}")
+
+    def convert_all(self):
+        """Convert all items"""
+        if not self.enc:
+            messagebox.showerror("Encoder not found", "Pick encoder or add to PATH.")
+            return
+        
+        if len(self.cards) == 0:
+            messagebox.showinfo("Convert", "Scan first.")
+            return
+        
+        if self.conversion_in_progress:
+            messagebox.showwarning("Busy", "Conversion already in progress.")
+            return
+        
+        # Prepare jobs
+        jobs = []
+        out_dir = Path(self.out_dir.get())
+        
+        for path_str, frame, combo, status, policy in self.cards:
+            path = Path(path_str)
+            fmt = combo.get().strip()
+            self.per_file_overrides[path_str] = fmt
+            
+            # Find base directory
+            base = None
+            for s in self.src_list.get(0, "end"):
+                sp = Path(s)
+                try:
+                    path.relative_to(sp)
+                    base = sp
+                    break
+                except Exception:
+                    pass
+            
+            if base:
+                rel = path.relative_to(base).with_suffix(".dds")
+                jobs.append(WorkItem(path, out_dir / rel.parent, fmt, rel.name, policy))
+            else:
+                jobs.append(WorkItem(path, out_dir, fmt, path.with_suffix(".dds").name, policy))
+        
+        self._save_config()
+        self.progress.configure(maximum=len(jobs), value=0)
+        self.status.configure(text="Converting…")
+        self.conversion_in_progress = True
+        
+        def run_all_conversions():
+            done = 0
+            fails = 0
+            
+            try:
+                for j in jobs:
+                    ok, msg, outp = convert_item(self.enc, j)
+                    done += 1
+                    fails += 0 if ok else 1
+                    self.root.after(0, lambda d=done: self.progress.configure(value=d))
+                
+                self.root.after(0, lambda: self._all_conversions_done(done, fails))
+            except Exception as e:
+                self.root.after(0, lambda: self._conversion_error(str(e)))
+        
+        threading.Thread(target=run_all_conversions, daemon=True).start()
+
+    def _all_conversions_done(self, done: int, fails: int):
+        """Handle all conversions completion"""
+        self.conversion_in_progress = False
+        self.status.configure(text=f"Done. OK={done - fails} FAIL={fails}")
+
+    def _conversion_error(self, error_msg: str):
+        """Handle conversion error"""
+        self.conversion_in_progress = False
+        messagebox.showerror("Conversion Error", f"Error during conversion: {error_msg}")
+        self.status.configure(text="Conversion failed")
+
+    def on_close(self):
+        """Handle application close"""
+        self._save_config()
+        self.root.destroy()
+
+def run_gui():
+    """Run the GUI application"""
+    root = tk.Tk()
+    app = TextureConverterApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    run_gui()
