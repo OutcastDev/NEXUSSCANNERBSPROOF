@@ -663,7 +663,7 @@ class TextureConverterApp:
             " • Discord: https://discord.gg/QxVUMX447v\n\n"
             "Credits:\n"
             " • Shout-out to VikoizBeast for testing the tool and providing inspiration.\n\n"
-            "This tool uses either texconv or Compressonator CLI for encoding.\n"
+            "This tool uses texconv for encoding.\n"
         )
 
     # Configuration methods
