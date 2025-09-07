@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Encrypted's Texture Converter - 1.0
-A universal DDS texture converter
+A universal DDS texture converter (Patreon references removed for Nexus compliance)
 """
 
 import os
@@ -146,8 +146,7 @@ def stem_lower(name: str) -> str:
 
 def clean_path(s: str) -> str:
     s = s.strip()
-    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
-        s = s[1:-1]
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):        s = s[1:-1]
     return s
 
 def exists_executable(p: str) -> bool:
@@ -360,7 +359,7 @@ def plan_jobs(roots: List[Path], out_dir: Path, per_file_overrides: Dict[str, st
         if root.is_file():
             if root.suffix.lower() in IMAGE_EXTS:
                 pol = policy_for_name(root.name)
-                fmt = per_file_overrides.get(str(root), pol["fmt"])
+                fmt = per_file_overrides.get(str(root), pol["fmt")
                 jobs.append(WorkItem(root, out_dir, fmt, root.with_suffix(".dds").name, pol))
         else:
             for r, _, files in os.walk(root):
@@ -368,7 +367,7 @@ def plan_jobs(roots: List[Path], out_dir: Path, per_file_overrides: Dict[str, st
                     p = Path(r) / f
                     if p.suffix.lower() in IMAGE_EXTS:
                         pol = policy_for_name(p.name)
-                        fmt = per_file_overrides.get(str(p), pol["fmt"])
+                        fmt = per_file_overrides.get(str(p), pol["fmt")
                         try:
                             rel = p.relative_to(root).with_suffix(".dds")
                             jobs.append(WorkItem(p, out_dir / rel.parent, fmt, rel.name, pol))
@@ -519,15 +518,11 @@ class TextureConverterApp:
                         font=("Segoe UI", 16, "bold"), fg=FG, bg=BG_FALLBACK)
         title.pack(side="left", padx=10)
         
-        # Links
+        # Links (Patreon removed for Nexus compliance)
         links = tk.Frame(header, bg=BG_FALLBACK)
         links.pack(side="right", padx=12)
         
-        patreon_link = self._create_link(links, "Patreon", 
-                                       "https://www.patreon.com/c/EncryptedStudios98", 
-                                       "#d3b9ff")
-        patreon_link.pack(side="right", padx=8)
-        
+        # Keep Discord link
         discord_link = self._create_link(links, "Discord", 
                                        "https://discord.gg/QxVUMX447v", 
                                        "#a8d0ff")
@@ -661,11 +656,10 @@ class TextureConverterApp:
         txt.pack(fill="both", expand=True, padx=10, pady=10)
 
     def show_about(self):
-        """Show about dialog"""
+        """Show about dialog (Patreon removed)"""
         messagebox.showinfo("About",
             "Encrypted's Universal DDS Converter\n\n"
             "Links:\n"
-            " • Patreon: https://www.patreon.com/c/EncryptedStudios98\n"
             " • Discord: https://discord.gg/QxVUMX447v\n\n"
             "Credits:\n"
             " • Shout-out to VikoizBeast for testing the tool and providing inspiration.\n\n"
@@ -786,8 +780,7 @@ class TextureConverterApp:
             return
             
         self._clear_grid()
-        roots = [Path(s) for s in self.src_list.get(0, "end")]
-        if not roots:
+        roots = [Path(s) for s in self.src_list.get(0, "end")]        if not roots:
             messagebox.showinfo("Scan", "Add a folder or files first.")
             return
         
